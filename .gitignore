@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Autorun artifacts (large output and repos)
+autorun-output/
+*.log
+
+# Docs vs big files
+*.pdf
+*.psd
+*.pptx
+
+# stray clone dirs
+/[0-9a-f]{32}/
+0877f58477a6653805c44b5c676784f7/
+14997fbb5d97452bceb3f2b325f20b4e/
+6b429ff51ccfe03ca6badb00332043b0/
+7f6ffc1299fe5341aaff54175b02f34a/
+c4f71fd0295c74c08499e2b761a4f11c/
+f231ba02b87391f5bd942c82aec96187/
