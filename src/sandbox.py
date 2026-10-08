@@ -217,12 +217,25 @@ class SandboxExecutor:
             return self._get_node_startup_command(repo_path)
         return ''
 
+    # Signatures found in source files that reveal a long-running server even
+    # when the framework isn't declared in a manifest (e.g. `python app.py`).
+    SERVER_SOURCE_MARKERS = (
+        'flask(', 'fastapi(', 'app.run(', 'uvicorn', 'gunicorn',
+        'import streamlit', 'aiohttp', 'import sanic', 'tornado.',
+        'from bottle', 'import bottle', 'app.listen(', 'http.createserver',
+        "require('express')", 'require("express")', 'socket.io',
+    )
+
     def is_server_workload(self, repo_path: Path, project_info: Dict[str, Any],
                            startup_cmd: str = None) -> bool:
         """Heuristically decide whether a repo runs a long-lived server.
 
         A *server* keeps running and listens on a port (it should be served on
         localhost); a *one-shot* program runs to completion and prints output.
+
+        Detection order: declared framework -> startup-command markers ->
+        source-code signatures (so an app started as `python app.py` whose
+        framework isn't in a manifest is still recognised as a server).
         """
         framework = (project_info.get('framework') or '').lower()
         if framework in self.SERVER_FRAMEWORKS:
@@ -230,7 +243,27 @@ class SandboxExecutor:
         if startup_cmd is None:
             startup_cmd = self.get_startup_command(repo_path, project_info)
         cmd = (startup_cmd or '').lower()
-        return any(marker in cmd for marker in self.SERVER_COMMAND_MARKERS)
+        if any(marker in cmd for marker in self.SERVER_COMMAND_MARKERS):
+            return True
+        return self._source_indicates_server(repo_path)
+
+    def _source_indicates_server(self, repo_path: Path) -> bool:
+        """Scan a few source files for web-server signatures."""
+        patterns = ('*.py', '*.js', '*.ts', '*.mjs')
+        scanned = 0
+        for pattern in patterns:
+            # Root files first, then one level down (typical app layouts).
+            for candidate in list(repo_path.glob(pattern)) + list(repo_path.glob(f'*/{pattern}')):
+                if scanned >= 60:  # keep it bounded on large repos
+                    return False
+                scanned += 1
+                try:
+                    text = candidate.read_text(encoding='utf-8', errors='ignore').lower()
+                except Exception:
+                    continue
+                if any(marker in text for marker in self.SERVER_SOURCE_MARKERS):
+                    return True
+        return False
 
     def _build_or_get_image(self, repo_path: Path, project_info: Dict[str, Any],
                             cache_key: str = None, cached_image_tag: str = None,

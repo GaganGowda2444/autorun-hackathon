@@ -66,11 +66,13 @@ python src/main.py ./my-local-repo --serve-report
 
 ### How live vs. one-shot is decided
 
-Autorun classifies the workload from the detected framework and the startup
-command it derives (e.g. `flask run`, `uvicorn`, `npm run dev`, `manage.py
-runserver`, `streamlit run`). Web frameworks and server commands → **live**;
-everything else → **one-shot**. You can always override with `--live` /
-`--no-live`.
+Autorun decides automatically — **you normally don't need any flag**. It looks at:
+1. the detected framework (Flask/FastAPI/Django/Streamlit/Express/Next/…),
+2. the startup command it derives (`flask run`, `uvicorn`, `npm run dev`, `manage.py runserver`, …), and
+3. the **source code itself** — e.g. `app.run(...)`, `Flask(...)`, `FastAPI(...)`, `uvicorn`, `app.listen(...)` — so an app started as plain `python app.py` is still recognised as a server even when it declares no framework.
+
+Any of these → **live** (served on localhost); everything else → **one-shot**
+(runs and prints full output). You can always override with `--live` / `--no-live`.
 
 ## Output
 

@@ -230,6 +230,38 @@ class TestSandboxExecutor:
         assert executor.is_server_workload(
             sample_cli_project, {'language': 'python', 'framework': 'unknown'}) is False
 
+    def test_is_server_workload_via_source(self, tmp_path):
+        """A `python app.py` Flask app with no declared framework is detected
+        as a server by scanning its source."""
+        app = tmp_path / "app.py"
+        app.write_text(
+            "from flask import Flask\n"
+            "app = Flask(__name__)\n"
+            "@app.route('/')\n"
+            "def home():\n"
+            "    return 'hi'\n"
+            "if __name__ == '__main__':\n"
+            "    app.run(host='0.0.0.0', port=5000)\n"
+        )
+        executor = SandboxExecutor()
+        # framework unknown and startup is a bare `python app.py`
+        assert executor.is_server_workload(
+            tmp_path, {'language': 'python', 'framework': 'unknown'},
+            startup_cmd='python app.py') is True
+
+    def test_is_server_workload_plain_script_via_source_false(self, tmp_path):
+        """A plain computational script is NOT misdetected as a server."""
+        script = tmp_path / "main.py"
+        script.write_text(
+            "import subprocess\n"
+            "print('result', sum(range(10)))\n"
+            "subprocess.run(['echo', 'done'])\n"
+        )
+        executor = SandboxExecutor()
+        assert executor.is_server_workload(
+            tmp_path, {'language': 'python', 'framework': 'unknown'},
+            startup_cmd='python main.py') is False
+
     def test_get_startup_command_returns_string(self, sample_python_project):
         """get_startup_command returns a non-empty command string."""
         executor = SandboxExecutor()
