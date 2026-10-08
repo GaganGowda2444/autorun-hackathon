@@ -204,6 +204,79 @@ class TestSandboxExecutor:
         """Test Docker execution checks for success indicators in logs."""
         pytest.skip("Docker tests require complex mocking - skipped for now")
 
+    # --- Live serve mode: workload classification & dispatch ---------------
+
+    def test_is_server_workload_flask(self, sample_python_project):
+        """A Flask project is classified as a long-running server."""
+        executor = SandboxExecutor()
+        assert executor.is_server_workload(
+            sample_python_project, {'language': 'python', 'framework': 'flask'}) is True
+
+    def test_is_server_workload_fastapi(self, sample_fastapi_project):
+        """A FastAPI project is classified as a server (via command markers)."""
+        executor = SandboxExecutor()
+        assert executor.is_server_workload(
+            sample_fastapi_project, {'language': 'python', 'framework': 'fastapi'}) is True
+
+    def test_is_server_workload_nextjs(self, sample_nextjs_project):
+        """A Next.js project is classified as a server."""
+        executor = SandboxExecutor()
+        assert executor.is_server_workload(
+            sample_nextjs_project, {'language': 'nodejs', 'framework': 'next'}) is True
+
+    def test_is_server_workload_cli_is_false(self, sample_cli_project):
+        """A plain one-shot CLI program is NOT classified as a server."""
+        executor = SandboxExecutor()
+        assert executor.is_server_workload(
+            sample_cli_project, {'language': 'python', 'framework': 'unknown'}) is False
+
+    def test_get_startup_command_returns_string(self, sample_python_project):
+        """get_startup_command returns a non-empty command string."""
+        executor = SandboxExecutor()
+        cmd = executor.get_startup_command(
+            sample_python_project, {'language': 'python', 'framework': 'flask'})
+        assert isinstance(cmd, str) and cmd
+
+    def test_find_free_port_returns_int(self):
+        """_find_free_port returns a usable port number."""
+        executor = SandboxExecutor()
+        port = executor._find_free_port(5000)
+        assert isinstance(port, int) and 1 <= port <= 65535
+
+    def test_serve_dispatches_to_subprocess_without_docker(self, sample_python_project):
+        """serve() uses the subprocess path when Docker is unavailable."""
+        executor = SandboxExecutor()
+        executor.docker_client = None
+        project_info = {'language': 'python', 'framework': 'flask'}
+
+        with patch.object(executor, '_serve_in_subprocess') as mock_serve:
+            mock_serve.return_value = {
+                'success': True, 'logs': '', 'url': 'http://localhost:5000',
+                'healthy': True, 'served': True,
+            }
+            result = executor.serve(sample_python_project, project_info, host_port=5000)
+
+            mock_serve.assert_called_once()
+            assert result['served'] is True
+            assert result['url'] == 'http://localhost:5000'
+            assert result['success'] is True
+
+    def test_serve_dispatches_to_docker_when_available(self, sample_python_project):
+        """serve() uses the Docker path when a Docker client is present."""
+        executor = SandboxExecutor()
+        executor.docker_client = MagicMock()
+        project_info = {'language': 'python', 'framework': 'flask'}
+
+        with patch.object(executor, '_serve_in_docker') as mock_serve:
+            mock_serve.return_value = {
+                'success': True, 'logs': '', 'url': 'http://localhost:5000',
+                'healthy': True, 'served': True,
+            }
+            result = executor.serve(sample_python_project, project_info)
+
+            mock_serve.assert_called_once()
+            assert result['served'] is True
+
     def test_metrics_collection_subprocess(self, sample_python_project):
         """Test that metrics are collected during subprocess execution."""
         executor = SandboxExecutor()

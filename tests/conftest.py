@@ -170,6 +170,21 @@ st.write('This is a test app.')
 
 
 @pytest.fixture
+def sample_cli_project(temp_dir):
+    """Create a sample one-shot Python CLI program (not a server)."""
+    project_dir = temp_dir / "cli_project"
+    project_dir.mkdir()
+
+    (project_dir / "main.py").write_text("""
+print("Computing...")
+print("Result:", sum(range(10)))
+""")
+    (project_dir / "requirements.txt").write_text("")
+
+    return project_dir
+
+
+@pytest.fixture
 def mock_docker_client():
     """Create a mock Docker client."""
     from unittest.mock import MagicMock

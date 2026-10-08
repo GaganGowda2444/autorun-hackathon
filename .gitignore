@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.venv/
 
 # Autorun artifacts (large output and repos)
 autorun-output/

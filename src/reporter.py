@@ -383,6 +383,12 @@ class ResultReporter:
         lines.append(f"Success: {'YES' if result.get('success', False) else 'NO'}")
         lines.append(f"Execution Time: {result.get('execution_time', 0):.2f} seconds")
 
+        if result.get('served'):
+            lines.append(f"Mode: LIVE (served)")
+            if result.get('url'):
+                lines.append(f"URL: {result['url']}")
+            lines.append(f"Health check: {'PASSED' if result.get('healthy') else 'not confirmed'}")
+
         if 'cache_hit' in result:
             lines.append(f"Cache: {'HIT' if result.get('cache_hit') else 'MISS'}")
         if result.get('cache_key'):
