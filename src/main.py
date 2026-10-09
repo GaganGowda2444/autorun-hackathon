@@ -295,8 +295,8 @@ def main():
 
         language = project_info.get('language')
         framework = project_info.get('framework', 'unknown')
-        base_image = 'python:3.9-slim' if language == 'python' else (
-            'node:16-slim' if language == 'nodejs' else 'unknown')
+        base_image = 'python:3.12-slim' if language == 'python' else (
+            'node:20-slim' if language == 'nodejs' else 'unknown')
         commit_sha = _get_commit_sha(repo_path)
         cache_key = EnvCache.make_key(args.repo_url, commit_sha, language, framework, base_image)
 

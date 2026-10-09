@@ -252,9 +252,9 @@ class SandboxExecutor:
         """Rewrite a UTF-16 / BOM-prefixed requirements.txt as plain UTF-8.
 
         Windows-authored repos often commit a UTF-16 `requirements.txt` (e.g.
-        from `pip freeze > requirements.txt` in PowerShell). Older pip versions
-        (such as the one in python:3.9-slim) fail to parse it, which breaks the
-        Docker build. Returns True if the file was rewritten.
+        from `pip freeze > requirements.txt` in PowerShell). Some pip versions
+        fail to parse it, which breaks the Docker build. Returns True if the
+        file was rewritten.
         """
         try:
             raw = req_path.read_bytes()
@@ -314,11 +314,11 @@ class SandboxExecutor:
         language = project_info.get('language')
 
         if language == 'python':
-            image = 'python:3.9-slim'
+            image = 'python:3.12-slim'
             install_cmd = 'pip install -r requirements.txt'
             startup_cmd = self._get_python_startup_command(repo_path)
         elif language == 'nodejs':
-            image = 'node:16-slim'
+            image = 'node:20-slim'
             install_cmd = 'npm install'
             startup_cmd = self._get_node_startup_command(repo_path)
         else:
