@@ -282,6 +282,18 @@ class TestSandboxExecutor:
         assert executor._normalize_requirements_file(req) is False
         assert req.read_text() == "flask\n"
 
+    def test_startup_command_flask_factory_wsgi(self, tmp_path):
+        """A Flask application-factory repo (wsgi.py = create_app()) is served
+        via `flask run`, not `python wsgi.py` (which would just exit)."""
+        (tmp_path / "requirements.txt").write_text("flask\n")
+        (tmp_path / "wsgi.py").write_text(
+            "from myapp import create_app\napp = create_app()\n")
+        executor = SandboxExecutor()
+        cmd = executor._get_python_startup_command(tmp_path)
+        assert 'flask run' in cmd
+        assert 'FLASK_APP=wsgi' in cmd
+        assert '--host=0.0.0.0' in cmd
+
     def test_get_startup_command_returns_string(self, sample_python_project):
         """get_startup_command returns a non-empty command string."""
         executor = SandboxExecutor()

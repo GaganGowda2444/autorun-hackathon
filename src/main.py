@@ -298,12 +298,15 @@ def main():
         base_image = 'python:3.12-slim' if language == 'python' else (
             'node:20-slim' if language == 'nodejs' else 'unknown')
         commit_sha = _get_commit_sha(repo_path)
-        cache_key = EnvCache.make_key(args.repo_url, commit_sha, language, framework, base_image)
 
         # Decide whether to run the app *live* (keep it running on a localhost
         # URL) or as a one-shot program. Web apps default to live; the user can
         # force either mode with --live / --no-live.
         startup_cmd = executor.get_startup_command(repo_path, project_info)
+        # Key the cache on the startup command too, so a cached image built
+        # with a stale entrypoint is rebuilt when detection changes.
+        cache_key = EnvCache.make_key(args.repo_url, commit_sha, language,
+                                      framework, base_image, startup_cmd)
         detected_server = executor.is_server_workload(repo_path, project_info, startup_cmd)
         live_mode = detected_server if args.live is None else args.live
         if live_mode:

@@ -1068,21 +1068,31 @@ CMD ["sh", "-c", "{startup_cmd}"]
             except:
                 pass
 
-        # Check for Flask app - prefer flask run if available
-        for py_file in repo_path.glob('*.py'):
+        # Detect a Flask app - including the application-factory / wsgi.py
+        # pattern - and serve it via `flask run` bound to 0.0.0.0.
+        #   * A bare app.run() binds 127.0.0.1, unreachable through Docker
+        #     port-publishing or from a Windows browser into WSL.
+        #   * A factory app (e.g. wsgi.py = `app = create_app()`) has no
+        #     app.run() at all, so `python wsgi.py` would just import and exit.
+        # `flask run` handles both; FLASK_APP points it at the right module.
+        flask_entry_order = ['wsgi.py', 'app.py', 'application.py', 'run.py',
+                             'main.py', 'server.py', 'manage.py']
+        ordered = [repo_path / f for f in flask_entry_order if (repo_path / f).exists()]
+        ordered += [p for p in sorted(repo_path.glob('*.py')) if p not in ordered]
+        for py_file in ordered:
             try:
-                content = py_file.read_text()
-                if 'app = Flask' in content or 'Flask(__name__)' in content:
-                    # Always serve via `flask run` bound to 0.0.0.0 so the app
-                    # is reachable from the host browser. A bare app.run()
-                    # typically binds 127.0.0.1, which is unreachable through
-                    # Docker port-publishing or from a Windows browser into WSL.
-                    # `flask run` ignores the module's own app.run(...) call;
-                    # FLASK_APP points it at this module.
-                    return (f'FLASK_APP={py_file.stem} python -m flask run '
-                            f'--host=0.0.0.0 --port=5000')
-            except:
-                pass
+                content = py_file.read_text(errors='ignore')
+            except Exception:
+                continue
+            imports_flask = 'from flask import' in content or 'import flask' in content
+            has_flask_app = (
+                'app = Flask' in content or 'Flask(__name__)' in content
+                or 'create_app(' in content
+                or (imports_flask and ('app = ' in content or 'application = ' in content))
+            )
+            if has_flask_app:
+                return (f'FLASK_APP={py_file.stem} python -m flask run '
+                        f'--host=0.0.0.0 --port=5000')
 
         # Check for FastAPI (uvicorn) - check before generic patterns
         for py_file in repo_path.glob('*.py'):
