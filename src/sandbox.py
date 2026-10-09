@@ -247,6 +247,44 @@ class SandboxExecutor:
             return True
         return self._source_indicates_server(repo_path)
 
+    @staticmethod
+    def _normalize_requirements_file(req_path: Path) -> bool:
+        """Rewrite a UTF-16 / BOM-prefixed requirements.txt as plain UTF-8.
+
+        Windows-authored repos often commit a UTF-16 `requirements.txt` (e.g.
+        from `pip freeze > requirements.txt` in PowerShell). Older pip versions
+        (such as the one in python:3.9-slim) fail to parse it, which breaks the
+        Docker build. Returns True if the file was rewritten.
+        """
+        try:
+            raw = req_path.read_bytes()
+        except Exception:
+            return False
+        if not raw:
+            return False
+        text = None
+        if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+            try:
+                text = raw.decode("utf-16")
+            except Exception:
+                return False
+        elif raw[:3] == b"\xef\xbb\xbf":
+            text = raw.decode("utf-8-sig")
+        elif b"\x00" in raw[:400]:  # UTF-16 without a BOM
+            for enc in ("utf-16-le", "utf-16-be"):
+                try:
+                    text = raw.decode(enc)
+                    break
+                except Exception:
+                    continue
+        if text is None:
+            return False
+        try:
+            req_path.write_text(text, encoding="utf-8")
+            return True
+        except Exception:
+            return False
+
     def _source_indicates_server(self, repo_path: Path) -> bool:
         """Scan a few source files for web-server signatures."""
         patterns = ('*.py', '*.js', '*.ts', '*.mjs')
@@ -314,12 +352,22 @@ class SandboxExecutor:
 
         # --- Cache miss / no cache: build the image ----------------------
         if not cached_used:
+            # Guard the install step so a repo with no manifest still builds,
+            # instead of failing on a missing requirements.txt / package.json.
+            if language == 'python':
+                install_run = ('if [ -f requirements.txt ]; then '
+                               'pip install -r requirements.txt; else '
+                               'echo "no requirements.txt - skipping install"; fi')
+            else:
+                install_run = ('if [ -f package.json ]; then npm install; else '
+                               'echo "no package.json - skipping install"; fi')
+
             # Create a Dockerfile
             dockerfile_content = f"""
 FROM {image}
 WORKDIR /app
 COPY . /app
-RUN {install_cmd}
+RUN {install_run}
 CMD ["sh", "-c", "{startup_cmd}"]
 """.strip()
 
@@ -339,6 +387,11 @@ CMD ["sh", "-c", "{startup_cmd}"]
                             shutil.copytree(item, dest)
                         else:
                             shutil.copy2(item, dest)
+
+                # Normalize a UTF-16/BOM requirements.txt so the image's pip
+                # can parse it (common in Windows-authored repos).
+                if self._normalize_requirements_file(Path(temp_dir) / "requirements.txt"):
+                    print("   Normalized requirements.txt encoding to UTF-8")
 
                 # Build the Docker image
                 print("   Building Docker image...")
@@ -534,32 +587,40 @@ CMD ["sh", "-c", "{startup_cmd}"]
         try:
             # --- Install dependencies -----------------------------------
             if language == 'python':
+                self._normalize_requirements_file(repo_path / 'requirements.txt')
+                manifest = repo_path / 'requirements.txt'
                 install_cmd = ['pip', 'install', '-r', 'requirements.txt']
                 startup_cmd_str = self._get_python_startup_command(repo_path)
             elif language == 'nodejs':
+                manifest = repo_path / 'package.json'
                 install_cmd = ['npm', 'install']
                 startup_cmd_str = self._get_node_startup_command(repo_path)
             else:
                 raise ValueError(f"Unsupported language for subprocess execution: {language}")
 
-            print("   Installing dependencies...")
-            use_shell = (language == 'nodejs' and sys.platform == 'win32')
-            install_result = subprocess.run(
-                install_cmd, capture_output=True, text=True,
-                timeout=180, shell=use_shell)
-            install_logs = f"STDOUT:\n{install_result.stdout}\nSTDERR:\n{install_result.stderr}"
-            if install_result.returncode != 0:
-                return {
-                    'success': False,
-                    'logs': install_logs,
-                    'error': f"Dependency installation failed with exit code {install_result.returncode}",
-                    'process_output': {'returncode': install_result.returncode,
-                                       'stdout': install_result.stdout,
-                                       'stderr': install_result.stderr},
-                    'metrics': {},
-                    'startup_command': startup_cmd_str,
-                    'served': True,
-                }
+            install_logs = ""
+            if not manifest.exists():
+                print(f"   No {manifest.name} - skipping dependency install")
+                install_logs = f"(no {manifest.name}; dependency install skipped)"
+            else:
+                print("   Installing dependencies...")
+                use_shell = (language == 'nodejs' and sys.platform == 'win32')
+                install_result = subprocess.run(
+                    install_cmd, capture_output=True, text=True,
+                    timeout=180, shell=use_shell)
+                install_logs = f"STDOUT:\n{install_result.stdout}\nSTDERR:\n{install_result.stderr}"
+                if install_result.returncode != 0:
+                    return {
+                        'success': False,
+                        'logs': install_logs,
+                        'error': f"Dependency installation failed with exit code {install_result.returncode}",
+                        'process_output': {'returncode': install_result.returncode,
+                                           'stdout': install_result.stdout,
+                                           'stderr': install_result.stderr},
+                        'metrics': {},
+                        'startup_command': startup_cmd_str,
+                        'served': True,
+                    }
 
             # --- Launch the server --------------------------------------
             # In subprocess mode there is no port remapping: the app binds
@@ -797,6 +858,7 @@ CMD ["sh", "-c", "{startup_cmd}"]
         try:
             # Install dependencies
             if language == 'python':
+                self._normalize_requirements_file(repo_path / 'requirements.txt')
                 install_cmd = ['pip', 'install', '-r', 'requirements.txt']
                 # Use shell=True for the startup command to handle shell operators
                 startup_cmd_str = self._get_python_startup_command(repo_path)

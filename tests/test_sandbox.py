@@ -262,6 +262,26 @@ class TestSandboxExecutor:
             tmp_path, {'language': 'python', 'framework': 'unknown'},
             startup_cmd='python main.py') is False
 
+    def test_normalize_requirements_utf16(self, tmp_path):
+        """A UTF-16 requirements.txt is rewritten as UTF-8 so pip can read it."""
+        req = tmp_path / "requirements.txt"
+        req.write_bytes("Flask==3.1.2\nrequests\n".encode("utf-16"))
+        executor = SandboxExecutor()
+        changed = executor._normalize_requirements_file(req)
+        assert changed is True
+        # Now readable as plain UTF-8 with the expected contents
+        text = req.read_text(encoding="utf-8")
+        assert "Flask==3.1.2" in text and "requests" in text
+        assert req.read_bytes()[:2] not in (b"\xff\xfe", b"\xfe\xff")
+
+    def test_normalize_requirements_utf8_noop(self, tmp_path):
+        """A normal UTF-8 requirements.txt is left unchanged."""
+        req = tmp_path / "requirements.txt"
+        req.write_text("flask\n", encoding="utf-8")
+        executor = SandboxExecutor()
+        assert executor._normalize_requirements_file(req) is False
+        assert req.read_text() == "flask\n"
+
     def test_get_startup_command_returns_string(self, sample_python_project):
         """get_startup_command returns a non-empty command string."""
         executor = SandboxExecutor()
