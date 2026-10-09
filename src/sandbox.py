@@ -1073,11 +1073,14 @@ CMD ["sh", "-c", "{startup_cmd}"]
             try:
                 content = py_file.read_text()
                 if 'app = Flask' in content or 'Flask(__name__)' in content:
-                    # Check if flask is in requirements
-                    if 'flask' in requirements:
-                        # Use python -m flask to ensure it works regardless of PATH
-                        return 'python -m flask run --host=0.0.0.0 --port=5000'
-                    return f'python {py_file.name}'
+                    # Always serve via `flask run` bound to 0.0.0.0 so the app
+                    # is reachable from the host browser. A bare app.run()
+                    # typically binds 127.0.0.1, which is unreachable through
+                    # Docker port-publishing or from a Windows browser into WSL.
+                    # `flask run` ignores the module's own app.run(...) call;
+                    # FLASK_APP points it at this module.
+                    return (f'FLASK_APP={py_file.stem} python -m flask run '
+                            f'--host=0.0.0.0 --port=5000')
             except:
                 pass
 
