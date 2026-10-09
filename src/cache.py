@@ -23,8 +23,13 @@ class EnvCache:
     # ---------- key ----------
     @staticmethod
     def make_key(repo_url: str, commit_sha: Optional[str], language: str,
-                 framework: str, base_image: str) -> str:
+                 framework: str, base_image: str,
+                 startup_command: Optional[str] = None) -> str:
         raw = f"{repo_url}|{commit_sha or 'HEAD'}|{language}|{framework}|{base_image}"
+        # Include the startup command so a cached image built with a different
+        # entrypoint is not silently reused after detection logic changes.
+        if startup_command:
+            raw += f"|{startup_command}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
     def _record_path(self, cache_key: str) -> Path:

@@ -204,6 +204,143 @@ class TestSandboxExecutor:
         """Test Docker execution checks for success indicators in logs."""
         pytest.skip("Docker tests require complex mocking - skipped for now")
 
+    # --- Live serve mode: workload classification & dispatch ---------------
+
+    def test_is_server_workload_flask(self, sample_python_project):
+        """A Flask project is classified as a long-running server."""
+        executor = SandboxExecutor()
+        assert executor.is_server_workload(
+            sample_python_project, {'language': 'python', 'framework': 'flask'}) is True
+
+    def test_is_server_workload_fastapi(self, sample_fastapi_project):
+        """A FastAPI project is classified as a server (via command markers)."""
+        executor = SandboxExecutor()
+        assert executor.is_server_workload(
+            sample_fastapi_project, {'language': 'python', 'framework': 'fastapi'}) is True
+
+    def test_is_server_workload_nextjs(self, sample_nextjs_project):
+        """A Next.js project is classified as a server."""
+        executor = SandboxExecutor()
+        assert executor.is_server_workload(
+            sample_nextjs_project, {'language': 'nodejs', 'framework': 'next'}) is True
+
+    def test_is_server_workload_cli_is_false(self, sample_cli_project):
+        """A plain one-shot CLI program is NOT classified as a server."""
+        executor = SandboxExecutor()
+        assert executor.is_server_workload(
+            sample_cli_project, {'language': 'python', 'framework': 'unknown'}) is False
+
+    def test_is_server_workload_via_source(self, tmp_path):
+        """A `python app.py` Flask app with no declared framework is detected
+        as a server by scanning its source."""
+        app = tmp_path / "app.py"
+        app.write_text(
+            "from flask import Flask\n"
+            "app = Flask(__name__)\n"
+            "@app.route('/')\n"
+            "def home():\n"
+            "    return 'hi'\n"
+            "if __name__ == '__main__':\n"
+            "    app.run(host='0.0.0.0', port=5000)\n"
+        )
+        executor = SandboxExecutor()
+        # framework unknown and startup is a bare `python app.py`
+        assert executor.is_server_workload(
+            tmp_path, {'language': 'python', 'framework': 'unknown'},
+            startup_cmd='python app.py') is True
+
+    def test_is_server_workload_plain_script_via_source_false(self, tmp_path):
+        """A plain computational script is NOT misdetected as a server."""
+        script = tmp_path / "main.py"
+        script.write_text(
+            "import subprocess\n"
+            "print('result', sum(range(10)))\n"
+            "subprocess.run(['echo', 'done'])\n"
+        )
+        executor = SandboxExecutor()
+        assert executor.is_server_workload(
+            tmp_path, {'language': 'python', 'framework': 'unknown'},
+            startup_cmd='python main.py') is False
+
+    def test_normalize_requirements_utf16(self, tmp_path):
+        """A UTF-16 requirements.txt is rewritten as UTF-8 so pip can read it."""
+        req = tmp_path / "requirements.txt"
+        req.write_bytes("Flask==3.1.2\nrequests\n".encode("utf-16"))
+        executor = SandboxExecutor()
+        changed = executor._normalize_requirements_file(req)
+        assert changed is True
+        # Now readable as plain UTF-8 with the expected contents
+        text = req.read_text(encoding="utf-8")
+        assert "Flask==3.1.2" in text and "requests" in text
+        assert req.read_bytes()[:2] not in (b"\xff\xfe", b"\xfe\xff")
+
+    def test_normalize_requirements_utf8_noop(self, tmp_path):
+        """A normal UTF-8 requirements.txt is left unchanged."""
+        req = tmp_path / "requirements.txt"
+        req.write_text("flask\n", encoding="utf-8")
+        executor = SandboxExecutor()
+        assert executor._normalize_requirements_file(req) is False
+        assert req.read_text() == "flask\n"
+
+    def test_startup_command_flask_factory_wsgi(self, tmp_path):
+        """A Flask application-factory repo (wsgi.py = create_app()) is served
+        via `flask run`, not `python wsgi.py` (which would just exit)."""
+        (tmp_path / "requirements.txt").write_text("flask\n")
+        (tmp_path / "wsgi.py").write_text(
+            "from myapp import create_app\napp = create_app()\n")
+        executor = SandboxExecutor()
+        cmd = executor._get_python_startup_command(tmp_path)
+        assert 'flask run' in cmd
+        assert 'FLASK_APP=wsgi' in cmd
+        assert '--host=0.0.0.0' in cmd
+
+    def test_get_startup_command_returns_string(self, sample_python_project):
+        """get_startup_command returns a non-empty command string."""
+        executor = SandboxExecutor()
+        cmd = executor.get_startup_command(
+            sample_python_project, {'language': 'python', 'framework': 'flask'})
+        assert isinstance(cmd, str) and cmd
+
+    def test_find_free_port_returns_int(self):
+        """_find_free_port returns a usable port number."""
+        executor = SandboxExecutor()
+        port = executor._find_free_port(5000)
+        assert isinstance(port, int) and 1 <= port <= 65535
+
+    def test_serve_dispatches_to_subprocess_without_docker(self, sample_python_project):
+        """serve() uses the subprocess path when Docker is unavailable."""
+        executor = SandboxExecutor()
+        executor.docker_client = None
+        project_info = {'language': 'python', 'framework': 'flask'}
+
+        with patch.object(executor, '_serve_in_subprocess') as mock_serve:
+            mock_serve.return_value = {
+                'success': True, 'logs': '', 'url': 'http://localhost:5000',
+                'healthy': True, 'served': True,
+            }
+            result = executor.serve(sample_python_project, project_info, host_port=5000)
+
+            mock_serve.assert_called_once()
+            assert result['served'] is True
+            assert result['url'] == 'http://localhost:5000'
+            assert result['success'] is True
+
+    def test_serve_dispatches_to_docker_when_available(self, sample_python_project):
+        """serve() uses the Docker path when a Docker client is present."""
+        executor = SandboxExecutor()
+        executor.docker_client = MagicMock()
+        project_info = {'language': 'python', 'framework': 'flask'}
+
+        with patch.object(executor, '_serve_in_docker') as mock_serve:
+            mock_serve.return_value = {
+                'success': True, 'logs': '', 'url': 'http://localhost:5000',
+                'healthy': True, 'served': True,
+            }
+            result = executor.serve(sample_python_project, project_info)
+
+            mock_serve.assert_called_once()
+            assert result['served'] is True
+
     def test_metrics_collection_subprocess(self, sample_python_project):
         """Test that metrics are collected during subprocess execution."""
         executor = SandboxExecutor()

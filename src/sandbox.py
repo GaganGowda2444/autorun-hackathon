@@ -190,32 +190,135 @@ class SandboxExecutor:
 
         return result
 
-    def _execute_in_docker(self, repo_path: Path, project_info: Dict[str, Any], timeout: int,
-                           cache_key: str = None, cached_image_tag: str = None,
-                           cached_startup_cmd: str = None) -> Dict[str, Any]:
-        """
-        Execute the project in a Docker container.
+    # ------------------------------------------------------------------
+    # Workload classification
+    # ------------------------------------------------------------------
+    # Frameworks whose normal entrypoint is a long-running web/server process.
+    SERVER_FRAMEWORKS = {
+        'flask', 'django', 'fastapi', 'streamlit',
+        'express', 'next', 'nuxt', 'nest', 'react', 'vue', 'angular',
+        'svelte', 'vite',
+    }
+    # Substrings in a startup command that indicate a long-running server.
+    SERVER_COMMAND_MARKERS = (
+        'flask run', 'uvicorn', 'gunicorn', 'runserver', 'streamlit run',
+        'manage.py runserver', 'npm run dev', 'npm start', 'npm run start',
+        'npm run serve', 'npm run preview', 'next dev', 'next start', 'nuxt',
+        'vite', 'react-scripts', 'nodemon', 'http.server', 'serve',
+        'daphne', 'hypercorn', 'waitress',
+    )
 
-        Args:
-            repo_path (Path): Path to the cloned repository.
-            project_info (dict): Information about the project.
-            timeout (int): Maximum execution time in seconds.
-            cache_key (str): If set, tag the built image as autorun-cache:<key>.
-            cached_image_tag (str): If set and present locally, skip the build.
-            cached_startup_cmd (str): Startup command from the cache record.
+    def get_startup_command(self, repo_path: Path, project_info: Dict[str, Any]) -> str:
+        """Return the startup command this executor would use for a repo."""
+        language = project_info.get('language')
+        if language == 'python':
+            return self._get_python_startup_command(repo_path)
+        if language == 'nodejs':
+            return self._get_node_startup_command(repo_path)
+        return ''
 
-        Returns:
-            dict: Execution result.
+    # Signatures found in source files that reveal a long-running server even
+    # when the framework isn't declared in a manifest (e.g. `python app.py`).
+    SERVER_SOURCE_MARKERS = (
+        'flask(', 'fastapi(', 'app.run(', 'uvicorn', 'gunicorn',
+        'import streamlit', 'aiohttp', 'import sanic', 'tornado.',
+        'from bottle', 'import bottle', 'app.listen(', 'http.createserver',
+        "require('express')", 'require("express")', 'socket.io',
+    )
+
+    def is_server_workload(self, repo_path: Path, project_info: Dict[str, Any],
+                           startup_cmd: str = None) -> bool:
+        """Heuristically decide whether a repo runs a long-lived server.
+
+        A *server* keeps running and listens on a port (it should be served on
+        localhost); a *one-shot* program runs to completion and prints output.
+
+        Detection order: declared framework -> startup-command markers ->
+        source-code signatures (so an app started as `python app.py` whose
+        framework isn't in a manifest is still recognised as a server).
         """
-        # Determine the base image and setup commands based on language
+        framework = (project_info.get('framework') or '').lower()
+        if framework in self.SERVER_FRAMEWORKS:
+            return True
+        if startup_cmd is None:
+            startup_cmd = self.get_startup_command(repo_path, project_info)
+        cmd = (startup_cmd or '').lower()
+        if any(marker in cmd for marker in self.SERVER_COMMAND_MARKERS):
+            return True
+        return self._source_indicates_server(repo_path)
+
+    @staticmethod
+    def _normalize_requirements_file(req_path: Path) -> bool:
+        """Rewrite a UTF-16 / BOM-prefixed requirements.txt as plain UTF-8.
+
+        Windows-authored repos often commit a UTF-16 `requirements.txt` (e.g.
+        from `pip freeze > requirements.txt` in PowerShell). Some pip versions
+        fail to parse it, which breaks the Docker build. Returns True if the
+        file was rewritten.
+        """
+        try:
+            raw = req_path.read_bytes()
+        except Exception:
+            return False
+        if not raw:
+            return False
+        text = None
+        if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+            try:
+                text = raw.decode("utf-16")
+            except Exception:
+                return False
+        elif raw[:3] == b"\xef\xbb\xbf":
+            text = raw.decode("utf-8-sig")
+        elif b"\x00" in raw[:400]:  # UTF-16 without a BOM
+            for enc in ("utf-16-le", "utf-16-be"):
+                try:
+                    text = raw.decode(enc)
+                    break
+                except Exception:
+                    continue
+        if text is None:
+            return False
+        try:
+            req_path.write_text(text, encoding="utf-8")
+            return True
+        except Exception:
+            return False
+
+    def _source_indicates_server(self, repo_path: Path) -> bool:
+        """Scan a few source files for web-server signatures."""
+        patterns = ('*.py', '*.js', '*.ts', '*.mjs')
+        scanned = 0
+        for pattern in patterns:
+            # Root files first, then one level down (typical app layouts).
+            for candidate in list(repo_path.glob(pattern)) + list(repo_path.glob(f'*/{pattern}')):
+                if scanned >= 60:  # keep it bounded on large repos
+                    return False
+                scanned += 1
+                try:
+                    text = candidate.read_text(encoding='utf-8', errors='ignore').lower()
+                except Exception:
+                    continue
+                if any(marker in text for marker in self.SERVER_SOURCE_MARKERS):
+                    return True
+        return False
+
+    def _build_or_get_image(self, repo_path: Path, project_info: Dict[str, Any],
+                            cache_key: str = None, cached_image_tag: str = None,
+                            cached_startup_cmd: str = None) -> Dict[str, Any]:
+        """Build a Docker image for the repo, or reuse a cached one.
+
+        Returns a dict with the built image object, its tag, build log, the
+        resolved startup command and base image, and whether the cache was hit.
+        """
         language = project_info.get('language')
 
         if language == 'python':
-            image = 'python:3.9-slim'
+            image = 'python:3.12-slim'
             install_cmd = 'pip install -r requirements.txt'
             startup_cmd = self._get_python_startup_command(repo_path)
         elif language == 'nodejs':
-            image = 'node:16-slim'
+            image = 'node:20-slim'
             install_cmd = 'npm install'
             startup_cmd = self._get_node_startup_command(repo_path)
         else:
@@ -249,12 +352,22 @@ class SandboxExecutor:
 
         # --- Cache miss / no cache: build the image ----------------------
         if not cached_used:
+            # Guard the install step so a repo with no manifest still builds,
+            # instead of failing on a missing requirements.txt / package.json.
+            if language == 'python':
+                install_run = ('if [ -f requirements.txt ]; then '
+                               'pip install -r requirements.txt; else '
+                               'echo "no requirements.txt - skipping install"; fi')
+            else:
+                install_run = ('if [ -f package.json ]; then npm install; else '
+                               'echo "no package.json - skipping install"; fi')
+
             # Create a Dockerfile
             dockerfile_content = f"""
 FROM {image}
 WORKDIR /app
 COPY . /app
-RUN {install_cmd}
+RUN {install_run}
 CMD ["sh", "-c", "{startup_cmd}"]
 """.strip()
 
@@ -275,6 +388,11 @@ CMD ["sh", "-c", "{startup_cmd}"]
                         else:
                             shutil.copy2(item, dest)
 
+                # Normalize a UTF-16/BOM requirements.txt so the image's pip
+                # can parse it (common in Windows-authored repos).
+                if self._normalize_requirements_file(Path(temp_dir) / "requirements.txt"):
+                    print("   Normalized requirements.txt encoding to UTF-8")
+
                 # Build the Docker image
                 print("   Building Docker image...")
                 if cache_key:
@@ -290,6 +408,338 @@ CMD ["sh", "-c", "{startup_cmd}"]
                 # Collect build logs
                 build_log = '\n'.join([str(log.get('stream', '')) for log in build_logs if 'stream' in log])
                 print(f"   Built image tagged: {image_tag}")
+
+        return {
+            'image_obj': image_obj,
+            'image_tag': image_tag,
+            'build_log': build_log,
+            'cached_used': cached_used,
+            'startup_cmd': startup_cmd,
+            'base_image': image,
+            'install_cmd': install_cmd,
+        }
+
+    # ------------------------------------------------------------------
+    # Live serve mode: keep a web app running and reachable on localhost
+    # ------------------------------------------------------------------
+    def serve(self, repo_path: Path, project_info: Dict[str, Any],
+              host_port: int = None, timeout: int = None,
+              cache_key: str = None, cached_image_tag: str = None,
+              cached_startup_cmd: str = None) -> Dict[str, Any]:
+        """Run a web application and keep it live on http://localhost:<port>.
+
+        Streams the application's logs to the console and blocks until the
+        process stops or the user presses Ctrl-C. Returns a result dict shaped
+        like :meth:`execute`'s so the reporter can consume it unchanged.
+        """
+        result = {
+            'success': False,
+            'language': project_info.get('language'),
+            'framework': project_info.get('framework'),
+            'logs': '',
+            'error': None,
+            'execution_time': 0,
+            'process_output': {},
+            'metrics': {},
+            'served': True,
+        }
+        start_time = time.time()
+        try:
+            if self.docker_client:
+                exec_result = self._serve_in_docker(
+                    repo_path, project_info, host_port, timeout,
+                    cache_key=cache_key, cached_image_tag=cached_image_tag,
+                    cached_startup_cmd=cached_startup_cmd,
+                )
+            else:
+                exec_result = self._serve_in_subprocess(
+                    repo_path, project_info, host_port, timeout)
+            result.update(exec_result)
+        except Exception as e:
+            result['error'] = str(e)
+            result['logs'] += f"\n[ERROR] {str(e)}"
+        result['execution_time'] = time.time() - start_time
+        return result
+
+    def _print_serve_banner(self, url: str, healthy: bool):
+        """Print a prominent banner pointing the user at the live app."""
+        print("\n" + "=" * 70)
+        if healthy:
+            print(f"🚀 LIVE — the application is running and reachable at:")
+            print(f"\n      👉  {url}\n")
+            print("   Open that URL in your browser to use the app.")
+        else:
+            print(f"⏳ The application was started and is being served at:")
+            print(f"\n      👉  {url}\n")
+            print("   (The port did not answer a health check yet — it may still")
+            print("    be starting, bind a different port, or not be a web app.)")
+        print("   Press Ctrl-C to stop the server and return.")
+        print("=" * 70 + "\n")
+
+    def _serve_in_docker(self, repo_path: Path, project_info: Dict[str, Any],
+                         host_port: int, timeout: int,
+                         cache_key: str = None, cached_image_tag: str = None,
+                         cached_startup_cmd: str = None) -> Dict[str, Any]:
+        """Serve a web app from inside a Docker container with a published port."""
+        language = project_info.get('language')
+        build_info = self._build_or_get_image(
+            repo_path, project_info,
+            cache_key=cache_key, cached_image_tag=cached_image_tag,
+            cached_startup_cmd=cached_startup_cmd,
+        )
+        image_obj = build_info['image_obj']
+        startup_cmd = build_info['startup_cmd']
+
+        container_port = self._extract_port_from_command(startup_cmd, language)
+        if not host_port:
+            host_port = self._find_free_port(container_port)
+
+        docker_config = self.config.get_docker_config()
+        print("   Starting container (live mode)...")
+        # Networking must stay enabled and the filesystem writable so the web
+        # server can bind its port and write runtime files (e.g. .pyc, sessions).
+        container = self.docker_client.containers.run(
+            image_obj.id,
+            detach=True,
+            mem_limit=docker_config.get('memory_limit', '500m'),
+            cpu_period=docker_config.get('cpu_period', 100000),
+            cpu_quota=docker_config.get('cpu_quota', 50000),
+            ports={f'{container_port}/tcp': host_port},
+        )
+
+        url = f"http://localhost:{host_port}"
+        healthy = self._wait_for_port('127.0.0.1', host_port, max_wait=30)
+        self._print_serve_banner(url, healthy)
+
+        collected = []
+        try:
+            for chunk in container.logs(stream=True, follow=True):
+                text = chunk.decode('utf-8', errors='replace')
+                sys.stdout.write(text)
+                sys.stdout.flush()
+                collected.append(text)
+        except KeyboardInterrupt:
+            print("\n\n🛑 Stopping server (Ctrl-C received)...")
+        finally:
+            try:
+                container.reload()
+                status = container.attrs.get('State', {}).get('Status')
+                exit_code = container.attrs.get('State', {}).get('ExitCode', 0)
+            except Exception:
+                status, exit_code = None, 0
+            try:
+                remaining = container.logs().decode('utf-8', errors='replace')
+                if remaining and not collected:
+                    collected.append(remaining)
+            except Exception:
+                pass
+            try:
+                container.stop(timeout=5)
+            except Exception:
+                pass
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
+
+        logs = ''.join(collected)
+        # If the container exited by itself with a non-zero code, that's a failure;
+        # a server we interrupted (status 'running' / stopped by us) counts as a
+        # successful live run if it ever answered on its port.
+        crashed = status == 'exited' and exit_code not in (0, None)
+        success = bool(healthy) and not crashed
+        return {
+            'success': success,
+            'logs': f"Build logs:\n{build_info['build_log']}\n\nExecution logs:\n{logs}",
+            'error': None if success else (
+                f"Container exited with code {exit_code}" if crashed
+                else "Server never became reachable on its port"),
+            'process_output': {'exit_code': exit_code or 0, 'logs': logs,
+                               'stdout': logs, 'stderr': ''},
+            'metrics': {},
+            'image_tag': build_info['image_tag'],
+            'image_id': image_obj.id if image_obj is not None else None,
+            'base_image': build_info['base_image'],
+            'startup_command': startup_cmd,
+            'cache_hit': build_info['cached_used'],
+            'served': True,
+            'url': url,
+            'healthy': healthy,
+        }
+
+    def _serve_in_subprocess(self, repo_path: Path, project_info: Dict[str, Any],
+                             host_port: int, timeout: int) -> Dict[str, Any]:
+        """Serve a web app as a host subprocess (used when Docker is absent).
+
+        Installs dependencies, launches the server, streams its combined
+        stdout/stderr live, prints the localhost URL, and blocks until the
+        process exits or the user presses Ctrl-C.
+        """
+        import threading
+
+        language = project_info.get('language')
+        repo_path = repo_path.resolve()
+        original_cwd = os.getcwd()
+        os.chdir(repo_path)
+
+        collected = []
+        process = None
+        try:
+            # --- Install dependencies -----------------------------------
+            if language == 'python':
+                self._normalize_requirements_file(repo_path / 'requirements.txt')
+                manifest = repo_path / 'requirements.txt'
+                install_cmd = ['pip', 'install', '-r', 'requirements.txt']
+                startup_cmd_str = self._get_python_startup_command(repo_path)
+            elif language == 'nodejs':
+                manifest = repo_path / 'package.json'
+                install_cmd = ['npm', 'install']
+                startup_cmd_str = self._get_node_startup_command(repo_path)
+            else:
+                raise ValueError(f"Unsupported language for subprocess execution: {language}")
+
+            install_logs = ""
+            if not manifest.exists():
+                print(f"   No {manifest.name} - skipping dependency install")
+                install_logs = f"(no {manifest.name}; dependency install skipped)"
+            else:
+                print("   Installing dependencies...")
+                use_shell = (language == 'nodejs' and sys.platform == 'win32')
+                install_result = subprocess.run(
+                    install_cmd, capture_output=True, text=True,
+                    timeout=180, shell=use_shell)
+                install_logs = f"STDOUT:\n{install_result.stdout}\nSTDERR:\n{install_result.stderr}"
+                if install_result.returncode != 0:
+                    return {
+                        'success': False,
+                        'logs': install_logs,
+                        'error': f"Dependency installation failed with exit code {install_result.returncode}",
+                        'process_output': {'returncode': install_result.returncode,
+                                           'stdout': install_result.stdout,
+                                           'stderr': install_result.stderr},
+                        'metrics': {},
+                        'startup_command': startup_cmd_str,
+                        'served': True,
+                    }
+
+            # --- Launch the server --------------------------------------
+            # In subprocess mode there is no port remapping: the app binds
+            # whatever port its startup command specifies, so --port (a Docker
+            # host:container mapping) cannot be honored here.
+            container_port = self._extract_port_from_command(startup_cmd_str, language)
+            if host_port and host_port != container_port:
+                print(f"   (Note: --port is only applied with Docker; this app "
+                      f"binds port {container_port}, so serving on {container_port}.)")
+            port = container_port
+            print(f"   Starting application (live mode) on port {port}...")
+
+            popen_kwargs = dict(
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, shell=True)
+            if sys.platform != 'win32':
+                popen_kwargs['start_new_session'] = True  # own process group for clean kill
+            process = subprocess.Popen(startup_cmd_str, **popen_kwargs)
+
+            def _reader():
+                try:
+                    for line in iter(process.stdout.readline, ''):
+                        sys.stdout.write(line)
+                        sys.stdout.flush()
+                        collected.append(line)
+                except Exception:
+                    pass
+
+            reader = threading.Thread(target=_reader, daemon=True)
+            reader.start()
+
+            url = f"http://localhost:{port}"
+            healthy = self._wait_for_port('127.0.0.1', port, max_wait=30)
+            self._print_serve_banner(url, healthy)
+
+            # --- Block until the process exits or the user interrupts ----
+            try:
+                while process.poll() is None:
+                    time.sleep(0.4)
+            except KeyboardInterrupt:
+                print("\n\n🛑 Stopping server (Ctrl-C received)...")
+            finally:
+                if process.poll() is None:
+                    self._kill_process_tree(process.pid)
+                try:
+                    process.wait(timeout=5)
+                except Exception:
+                    pass
+                reader.join(timeout=2)
+
+            logs = ''.join(collected)
+            returncode = process.returncode
+            # Process exited on its own with an error => failure. Otherwise a
+            # server that answered its port (or that we stopped) is a success.
+            crashed = returncode not in (0, None) and not healthy
+            success = bool(healthy) or returncode in (0, None)
+            if crashed:
+                success = False
+            return {
+                'success': success,
+                'logs': f"Installation logs:\n{install_logs}\n\nExecution logs:\n{logs}",
+                'error': None if success else f"Process exited with code {returncode}",
+                'process_output': {'returncode': returncode or 0,
+                                   'stdout': logs, 'stderr': ''},
+                'metrics': {},
+                'startup_command': startup_cmd_str,
+                'served': True,
+                'url': url,
+                'healthy': healthy,
+            }
+        finally:
+            os.chdir(original_cwd)
+
+    def _find_free_port(self, preferred: int) -> int:
+        """Return `preferred` if free, otherwise an OS-assigned free port."""
+        if not self._check_tcp_port('127.0.0.1', preferred):
+            # Nothing is listening there; try to bind to confirm it's bindable.
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    s.bind(('', preferred))
+                    return preferred
+            except OSError:
+                pass
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(('', 0))
+            return s.getsockname()[1]
+
+    def _execute_in_docker(self, repo_path: Path, project_info: Dict[str, Any], timeout: int,
+                           cache_key: str = None, cached_image_tag: str = None,
+                           cached_startup_cmd: str = None) -> Dict[str, Any]:
+        """
+        Execute the project in a Docker container.
+
+        Args:
+            repo_path (Path): Path to the cloned repository.
+            project_info (dict): Information about the project.
+            timeout (int): Maximum execution time in seconds.
+            cache_key (str): If set, tag the built image as autorun-cache:<key>.
+            cached_image_tag (str): If set and present locally, skip the build.
+            cached_startup_cmd (str): Startup command from the cache record.
+
+        Returns:
+            dict: Execution result.
+        """
+        # Build (or reuse a cached) Docker image for this repository.
+        language = project_info.get('language')
+        build_info = self._build_or_get_image(
+            repo_path, project_info,
+            cache_key=cache_key,
+            cached_image_tag=cached_image_tag,
+            cached_startup_cmd=cached_startup_cmd,
+        )
+        image_obj = build_info['image_obj']
+        image_tag = build_info['image_tag']
+        build_log = build_info['build_log']
+        cached_used = build_info['cached_used']
+        startup_cmd = build_info['startup_cmd']
+        image = build_info['base_image']
 
         # Run the container with resource limits
         print("   Running container...")
@@ -408,6 +858,7 @@ CMD ["sh", "-c", "{startup_cmd}"]
         try:
             # Install dependencies
             if language == 'python':
+                self._normalize_requirements_file(repo_path / 'requirements.txt')
                 install_cmd = ['pip', 'install', '-r', 'requirements.txt']
                 # Use shell=True for the startup command to handle shell operators
                 startup_cmd_str = self._get_python_startup_command(repo_path)
@@ -462,7 +913,11 @@ CMD ["sh", "-c", "{startup_cmd}"]
 
                 # Extract port from startup command for health check
                 port = self._extract_port_from_command(startup_cmd_str, language)
-                print(f"   Waiting for server on port {port}...")
+                # Only a long-running server is worth waiting on a port for;
+                # a one-shot program just runs to completion.
+                is_server = self.is_server_workload(repo_path, project_info, startup_cmd_str)
+                if is_server:
+                    print(f"   Waiting for server on port {port}...")
 
                 # Start metrics collection in a separate thread
                 import threading
@@ -503,9 +958,11 @@ CMD ["sh", "-c", "{startup_cmd}"]
                 metrics_thread.start()
 
                 # TCP Health Check - wait for server port to become available
-                print(f"   Checking server health on port {port}...")
-                if self._wait_for_port('127.0.0.1', port, max_wait=self.SERVER_STARTUP_TIMEOUT):
-                    print(f"   Server is healthy on port {port}")
+                # (only for server workloads; skip for one-shot CLI programs).
+                if is_server:
+                    print(f"   Checking server health on port {port}...")
+                    if self._wait_for_port('127.0.0.1', port, max_wait=self.SERVER_STARTUP_TIMEOUT):
+                        print(f"   Server is healthy on port {port}")
 
                 # Wait for the process to finish or timeout
                 # For servers, we only wait a short time to capture startup
@@ -611,18 +1068,31 @@ CMD ["sh", "-c", "{startup_cmd}"]
             except:
                 pass
 
-        # Check for Flask app - prefer flask run if available
-        for py_file in repo_path.glob('*.py'):
+        # Detect a Flask app - including the application-factory / wsgi.py
+        # pattern - and serve it via `flask run` bound to 0.0.0.0.
+        #   * A bare app.run() binds 127.0.0.1, unreachable through Docker
+        #     port-publishing or from a Windows browser into WSL.
+        #   * A factory app (e.g. wsgi.py = `app = create_app()`) has no
+        #     app.run() at all, so `python wsgi.py` would just import and exit.
+        # `flask run` handles both; FLASK_APP points it at the right module.
+        flask_entry_order = ['wsgi.py', 'app.py', 'application.py', 'run.py',
+                             'main.py', 'server.py', 'manage.py']
+        ordered = [repo_path / f for f in flask_entry_order if (repo_path / f).exists()]
+        ordered += [p for p in sorted(repo_path.glob('*.py')) if p not in ordered]
+        for py_file in ordered:
             try:
-                content = py_file.read_text()
-                if 'app = Flask' in content or 'Flask(__name__)' in content:
-                    # Check if flask is in requirements
-                    if 'flask' in requirements:
-                        # Use python -m flask to ensure it works regardless of PATH
-                        return 'python -m flask run --host=0.0.0.0 --port=5000'
-                    return f'python {py_file.name}'
-            except:
-                pass
+                content = py_file.read_text(errors='ignore')
+            except Exception:
+                continue
+            imports_flask = 'from flask import' in content or 'import flask' in content
+            has_flask_app = (
+                'app = Flask' in content or 'Flask(__name__)' in content
+                or 'create_app(' in content
+                or (imports_flask and ('app = ' in content or 'application = ' in content))
+            )
+            if has_flask_app:
+                return (f'FLASK_APP={py_file.stem} python -m flask run '
+                        f'--host=0.0.0.0 --port=5000')
 
         # Check for FastAPI (uvicorn) - check before generic patterns
         for py_file in repo_path.glob('*.py'):

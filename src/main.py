@@ -142,6 +142,39 @@ def infer_repository_purpose(stdout: str, stderr: str, result: dict) -> str:
     return '\n'.join(f"  * {p}" for p in purposes)
 
 
+def _serve_report(output_dir: str, port: int = 0):
+    """Serve the latest HTML report on a localhost URL until Ctrl-C."""
+    import functools
+    import http.server
+    import socketserver
+
+    report_root = Path(output_dir) / "latest"
+    if not (report_root / "report.html").exists():
+        # Fall back to the output dir itself if 'latest' isn't there.
+        report_root = Path(output_dir)
+    if not report_root.exists():
+        print("   (No report directory to serve.)")
+        return
+
+    handler = functools.partial(
+        http.server.SimpleHTTPRequestHandler, directory=str(report_root))
+    try:
+        with socketserver.TCPServer(("", port), handler) as httpd:
+            actual_port = httpd.server_address[1]
+            url = f"http://localhost:{actual_port}/report.html"
+            print("\n" + "=" * 70)
+            print("📊 REPORT SERVER — view the full result in your browser at:")
+            print(f"\n      👉  {url}\n")
+            print("   Press Ctrl-C to stop the report server.")
+            print("=" * 70 + "\n")
+            try:
+                httpd.serve_forever()
+            except KeyboardInterrupt:
+                print("\n🛑 Report server stopped.")
+    except OSError as e:
+        print(f"   Could not start report server: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Automatically clone, build, and run GitHub repositories in a sandbox"
@@ -175,6 +208,32 @@ def main():
         "--no-cache",
         action="store_true",
         help="Force a fresh build, ignoring and not writing the environment cache"
+    )
+    live_group = parser.add_mutually_exclusive_group()
+    live_group.add_argument(
+        "--live",
+        dest="live",
+        action="store_true",
+        default=None,
+        help="Keep the app running and serve it on http://localhost:<port> "
+             "(auto-enabled for detected web apps)"
+    )
+    live_group.add_argument(
+        "--no-live",
+        dest="live",
+        action="store_false",
+        help="Run once to completion and print output, even for web apps"
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Host port to expose the live app on (default: the app's own port)"
+    )
+    parser.add_argument(
+        "--serve-report",
+        action="store_true",
+        help="After a one-shot run, serve the HTML report on a localhost URL"
     )
     parser.add_argument(
         "--cache-list",
@@ -236,50 +295,73 @@ def main():
 
         language = project_info.get('language')
         framework = project_info.get('framework', 'unknown')
-        base_image = 'python:3.9-slim' if language == 'python' else (
-            'node:16-slim' if language == 'nodejs' else 'unknown')
+        base_image = 'python:3.12-slim' if language == 'python' else (
+            'node:20-slim' if language == 'nodejs' else 'unknown')
         commit_sha = _get_commit_sha(repo_path)
-        cache_key = EnvCache.make_key(args.repo_url, commit_sha, language, framework, base_image)
+
+        # Decide whether to run the app *live* (keep it running on a localhost
+        # URL) or as a one-shot program. Web apps default to live; the user can
+        # force either mode with --live / --no-live.
+        startup_cmd = executor.get_startup_command(repo_path, project_info)
+        # Key the cache on the startup command too, so a cached image built
+        # with a stale entrypoint is rebuilt when detection changes.
+        cache_key = EnvCache.make_key(args.repo_url, commit_sha, language,
+                                      framework, base_image, startup_cmd)
+        detected_server = executor.is_server_workload(repo_path, project_info, startup_cmd)
+        live_mode = detected_server if args.live is None else args.live
+        if live_mode:
+            print(f"   Detected a long-running server -> LIVE mode "
+                  f"({'auto' if args.live is None else 'forced'})")
+        else:
+            print(f"   Running as a one-shot program "
+                  f"({'auto' if args.live is None else 'forced'})")
 
         cached = None
         if not args.no_cache and executor.docker_client is not None:
             cached = cache.get(cache_key)
 
+        # Build the keyword args shared by execute() and serve().
         if cached:
             print(f"   [CACHE HIT] key={cache_key} - reusing cached environment")
-            result = executor.execute(
-                repo_path, project_info, args.timeout,
+            run_kwargs = dict(
                 cache_key=cache_key,
                 cached_image_tag=cached['image_tag'],
                 cached_startup_cmd=cached.get('startup_command'),
             )
-            result['cache_hit'] = True
-            result['cache_key'] = cache_key
-            cache.touch(cache_key)
         else:
-            print(f"   [CACHE MISS] key={cache_key} - building fresh environment")
-            result = executor.execute(
-                repo_path, project_info, args.timeout, cache_key=cache_key,
-            )
-            result['cache_hit'] = False
-            result['cache_key'] = cache_key
-            # Only successful Docker builds are worth caching
-            if (result.get('success') and executor.docker_client is not None
-                    and result.get('image_tag')):
-                cache.put(cache_key, {
-                    'repo_url': args.repo_url,
-                    'commit_sha': commit_sha,
-                    'language': language,
-                    'framework': framework,
-                    'base_image': base_image,
-                    'image_tag': result['image_tag'],
-                    'image_id': result.get('image_id'),
-                    'startup_command': result.get('startup_command'),
-                })
-                print(f"   [CACHE] Saved environment as '{result['image_tag']}'")
+            if executor.docker_client is not None:
+                print(f"   [CACHE MISS] key={cache_key} - building fresh environment")
+            run_kwargs = dict(cache_key=cache_key)
 
-        # Step 4: Show application output
-        if not args.no_output:
+        if live_mode:
+            result = executor.serve(
+                repo_path, project_info,
+                host_port=args.port, timeout=args.timeout, **run_kwargs)
+        else:
+            result = executor.execute(
+                repo_path, project_info, args.timeout, **run_kwargs)
+
+        result['cache_hit'] = bool(cached)
+        result['cache_key'] = cache_key
+        if cached:
+            cache.touch(cache_key)
+        elif (result.get('success') and executor.docker_client is not None
+                and result.get('image_tag')):
+            # Only successful Docker builds are worth caching
+            cache.put(cache_key, {
+                'repo_url': args.repo_url,
+                'commit_sha': commit_sha,
+                'language': language,
+                'framework': framework,
+                'base_image': base_image,
+                'image_tag': result['image_tag'],
+                'image_id': result.get('image_id'),
+                'startup_command': result.get('startup_command'),
+            })
+            print(f"   [CACHE] Saved environment as '{result['image_tag']}'")
+
+        # Step 4: Show application output (one-shot runs stream live already)
+        if not args.no_output and not result.get('served'):
             print_application_output(result)
 
         # Step 5: Report results
@@ -289,6 +371,11 @@ def main():
 
         print("\nExecution completed!")
         print(f"Results saved to: {args.output_dir}")
+
+        # Optionally serve the HTML report on a localhost URL so the full
+        # result can be viewed in a browser (handy for one-shot runs).
+        if args.serve_report and not result.get('served'):
+            _serve_report(args.output_dir)
 
     except KeyboardInterrupt:
         print("\nExecution interrupted by user")
